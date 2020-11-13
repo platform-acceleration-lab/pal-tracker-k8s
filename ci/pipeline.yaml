@@ -20,6 +20,10 @@ jobs:
           - -exc
           - |
             cd source-code
+            service postgresql start
+            sudo -u postgres psql -f databases/tracker/create_databases.sql
+            flyway -url="jdbc:postgresql://localhost:5432/tracker_test" -locations=filesystem:databases/tracker migrate -user=tracker -password=password
+
             ./gradlew test
   - task: pack-and-publish
     privileged: true
@@ -46,12 +50,52 @@ jobs:
             ./gradlew bootBuildImage --imageName=((DOCKER_HUB_USERNAME))/pal-tracker:build-${BUILD_NUMBER}
             docker login -u ((DOCKER_HUB_USERNAME)) -p ((DOCKER_HUB_PASSWORD))
             docker push ((DOCKER_HUB_USERNAME))/pal-tracker:build-${BUILD_NUMBER}
+- name: migrate-review-db
+  plan:
+  - get: source-code
+    trigger: true
+    passed:
+    - build-pack-and-publish
+  - get: version
+    passed:
+    - build-pack-and-publish
+  - task: migrate-db
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source:
+          repository: pivotaleducation/migrate-db-k8s
+      inputs:
+      - name: source-code
+      - name: version
+      run:
+        path: sh
+        args:
+          - -exc
+          - |
+            mkdir -p ~/.kube
+            echo '((KUBECONFIG))' > ~/.kube/config
+
+            cd source-code
+
+            kubectl port-forward --namespace review svc/tracker-db-postgresql 15432:5432 &
+            pid=$!
+
+            export REVIEW_DB_PASSWORD=$(kubectl get secret --namespace review tracker-db-postgresql -o jsonpath="{.data.postgresql-password}" | base64 --decode)
+            flyway -url="jdbc:postgresql://localhost:15432/((REVIEW_DB_NAME))" -locations=filesystem:databases/tracker migrate -user=((REVIEW_DB_USER)) -password="$REVIEW_DB_PASSWORD"
+            success=$?
+
+            kill $pid
+
+            return $success
 - name: deploy-to-review
   plan:
   - get: source-code
     trigger: true
     passed:
     - build-pack-and-publish
+    - migrate-review-db
   - get: version
     passed:
     - build-pack-and-publish
